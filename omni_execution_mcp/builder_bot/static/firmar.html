@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'sha256-+P+43/yeKCDQUyFYxNNwOu/uQH3UATK9IKbWztXgpRI='; script-src 'sha256-DfncIvuRQ8VNFEaNNy3Vges56MJhC7vRzP08BrxRg2I='; connect-src https://api.hyperliquid.xyz https://api.hyperliquid-testnet.xyz; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Activar bot de trading</title>
+<style>
+:root { color-scheme: light dark; --bg: #f6f7f9; --card: #ffffff; --text: #14171f; --muted: #5b6270; --line: #dde1e8; --accent: #1f6feb; --ok: #1a7f37; --err: #cf222e; }
+@media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --card: #161b22; --text: #e6edf3; --muted: #9aa4b2; --line: #30363d; --accent: #4493f8; --ok: #3fb950; --err: #f85149; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 560px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 1.4rem; margin: 0 0 8px; }
+.muted { color: var(--muted); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-top: 16px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9rem; word-break: break-all; }
+.bloque { display: block; }
+.banner { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; font-weight: 600; margin: 16px 0 0; }
+.banner.mainnet { border-color: var(--err); color: var(--err); }
+ol { padding-left: 20px; margin: 12px 0 0; }
+li { margin: 12px 0; }
+.estado { display: block; font-size: .9rem; color: var(--muted); }
+.estado.ok, .listo { color: var(--ok); font-weight: 600; }
+.estado.err, .error { color: var(--err); font-weight: 600; }
+button { width: 100%; margin-top: 16px; padding: 12px; font: inherit; font-weight: 600; color: #fff; background: var(--accent); border: 0; border-radius: 8px; cursor: pointer; }
+button:disabled { opacity: .6; cursor: progress; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Activar el bot de trading</h1>
+  <p class="muted">Firmás con tu wallet principal. Esta página nunca te pide tu clave privada ni tu frase semilla.</p>
+  <p id="error" class="error" role="alert" hidden></p>
+  <div id="resumen" hidden>
+    <p id="red" class="banner"></p>
+    <div class="card">
+      <span class="muted bloque">Tu cuenta de Hyperliquid</span>
+      <span id="cuenta" class="mono bloque"></span>
+      <ol id="pasos"></ol>
+    </div>
+    <p id="nota-builder" class="muted" hidden>La comisión del builder solo se cobra en las órdenes que mandes con el bot, además de las comisiones de Hyperliquid.</p>
+    <p id="nota-agente" class="muted" hidden>El agente puede abrir y cerrar posiciones por vos, pero no puede retirar ni transferir fondos: eso solo lo firma tu wallet principal.</p>
+    <button id="firmar" type="button">Conectar wallet y firmar</button>
+    <p id="final" class="listo" role="status" hidden></p>
+  </div>
+</main>
+<script>
+(() => {
+  "use strict";
+  const API = {
+    mainnet: "https://api.hyperliquid.xyz",
+    testnet: "https://api.hyperliquid-testnet.xyz",
+  };
+  const CHAIN = { mainnet: "Mainnet", testnet: "Testnet" };
+  const ADDRESS = /^0x[0-9a-f]{40}$/;
+  const RATE = /^\d+(\.\d+)?%$/;
+  const NAME = /^[A-Za-z0-9_ -]{1,32}$/;
+  const MAX_RATE_PERCENT = 0.1;
+  const DOMAIN_TYPES = [
+    { name: "name", type: "string" },
+    { name: "version", type: "string" },
+    { name: "chainId", type: "uint256" },
+    { name: "verifyingContract", type: "address" },
+  ];
+  const el = (id) => document.getElementById(id);
+  let lastNonce = 0;
+
+  function readParams() {
+    const raw = new URLSearchParams(window.location.hash.slice(1));
+    const p = {
+      red: raw.get("red") || "",
+      cuenta: (raw.get("cuenta") || "").toLowerCase(),
+      builder: (raw.get("builder") || "").toLowerCase(),
+      tasa: raw.get("tasa") || "",
+      agente: (raw.get("agente") || "").toLowerCase(),
+      nombre: raw.get("nombre") || "",
+    };
+    if (!Object.prototype.hasOwnProperty.call(API, p.red)) {
+      throw new Error("El link no indica una red válida.");
+    }
+    if (!ADDRESS.test(p.cuenta)) throw new Error("El link no trae una cuenta válida.");
+    if (!p.builder && !p.agente) throw new Error("El link no trae nada para firmar.");
+    if (p.builder && (!ADDRESS.test(p.builder) || !RATE.test(p.tasa))) {
+      throw new Error("El builder o la tasa del link no son válidos.");
+    }
+    if (p.builder && parseFloat(p.tasa) > MAX_RATE_PERCENT) {
+      throw new Error("La tasa del link supera el tope de 0.1% para perps.");
+    }
+    if (p.agente && (!ADDRESS.test(p.agente) || !NAME.test(p.nombre))) {
+      throw new Error("El agente o su nombre no son válidos.");
+    }
+    return p;
+  }
+
+  function buildSteps(p) {
+    const steps = [];
+    if (p.builder) {
+      steps.push({
+        label: "Autorizar una comisión de builder de hasta " + p.tasa + " del monto operado",
+        detail: "Builder: " + p.builder,
+        primaryType: "HyperliquidTransaction:ApproveBuilderFee",
+        fields: [
+          { name: "hyperliquidChain", type: "string" },
+          { name: "maxFeeRate", type: "string" },
+          { name: "builder", type: "address" },
+          { name: "nonce", type: "uint64" },
+        ],
+        action: (chainHex, nonce) => ({
+          type: "approveBuilderFee",
+          signatureChainId: chainHex,
+          hyperliquidChain: CHAIN[p.red],
+          maxFeeRate: p.tasa,
+          builder: p.builder,
+          nonce,
+        }),
+      });
+    }
+    if (p.agente) {
+      steps.push({
+        label: "Autorizar al agente «" + p.nombre + "»: opera, no retira",
+        detail: "Agente: " + p.agente,
+        primaryType: "HyperliquidTransaction:ApproveAgent",
+        fields: [
+          { name: "hyperliquidChain", type: "string" },
+          { name: "agentAddress", type: "address" },
+          { name: "agentName", type: "string" },
+          { name: "nonce", type: "uint64" },
+        ],
+        action: (chainHex, nonce) => ({
+          type: "approveAgent",
+          signatureChainId: chainHex,
+          hyperliquidChain: CHAIN[p.red],
+          agentAddress: p.agente,
+          agentName: p.nombre,
+          nonce,
+        }),
+      });
+    }
+    return steps;
+  }
+
+  function render(p, steps) {
+    const red = el("red");
+    red.textContent = p.red === "mainnet" ? "Red: Mainnet (fondos reales)" : "Red: Testnet (sin fondos reales)";
+    red.classList.toggle("mainnet", p.red === "mainnet");
+    el("cuenta").textContent = p.cuenta;
+    el("nota-builder").hidden = !p.builder;
+    el("nota-agente").hidden = !p.agente;
+    for (const step of steps) {
+      const item = document.createElement("li");
+      const label = document.createElement("strong");
+      label.textContent = step.label;
+      const detail = document.createElement("span");
+      detail.className = "mono bloque";
+      detail.textContent = step.detail;
+      step.status = document.createElement("span");
+      setStatus(step, "Pendiente");
+      item.append(label, detail, step.status);
+      el("pasos").append(item);
+    }
+    el("resumen").hidden = false;
+  }
+
+  function setStatus(step, text, kind) {
+    step.status.textContent = text;
+    step.status.className = kind ? "estado " + kind : "estado";
+  }
+
+  function nextNonce() {
+    lastNonce = Math.max(Date.now(), lastNonce + 1);
+    return lastNonce;
+  }
+
+  function splitSignature(sig) {
+    if (typeof sig !== "string" || !/^0x[0-9a-fA-F]{130}$/.test(sig)) {
+      throw new Error("La wallet devolvió una firma inesperada.");
+    }
+    let v = parseInt(sig.slice(130, 132), 16);
+    if (v < 27) v += 27;
+    return { r: "0x" + sig.slice(2, 66), s: "0x" + sig.slice(66, 130), v };
+  }
+
+  async function submit(red, action, nonce, signature) {
+    const resp = await window.fetch(API[red] + "/exchange", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, nonce, signature, vaultAddress: null, expiresAfter: null }),
+    });
+    let data = null;
+    try {
+      data = await resp.json();
+    } catch (_) {
+      data = null;
+    }
+    if (!data || data.status !== "ok") {
+      const reason = data && typeof data.response === "string"
+        ? data.response
+        : "respuesta inesperada (HTTP " + resp.status + ")";
+      throw new Error("Hyperliquid rechazó la firma: " + reason);
+    }
+  }
+
+  async function signAll(p, steps) {
+    const eth = window.ethereum;
+    if (!eth || typeof eth.request !== "function") {
+      throw new Error("No encuentro una wallet en este navegador (MetaMask, Rabby…).");
+    }
+    const accounts = await eth.request({ method: "eth_requestAccounts" });
+    const account = String((accounts && accounts[0]) || "");
+    if (account.toLowerCase() !== p.cuenta) {
+      throw new Error("Tu wallet tiene conectada " + (account || "ninguna cuenta") + ", pero el bot espera "
+        + p.cuenta + ". Cambiá de cuenta y reintentá.");
+    }
+    const chainHex = String(await eth.request({ method: "eth_chainId" })).toLowerCase();
+    if (!/^0x[0-9a-f]+$/.test(chainHex)) throw new Error("La wallet no informó una red válida.");
+    const domain = {
+      name: "HyperliquidSignTransaction",
+      version: "1",
+      chainId: parseInt(chainHex, 16),
+      verifyingContract: "0x0000000000000000000000000000000000000000",
+    };
+    for (const step of steps) {
+      if (step.done) continue;
+      const nonce = nextNonce();
+      const action = step.action(chainHex, nonce);
+      const message = {};
+      for (const field of step.fields) message[field.name] = action[field.name];
+      const typedData = {
+        domain,
+        types: { EIP712Domain: DOMAIN_TYPES, [step.primaryType]: step.fields },
+        primaryType: step.primaryType,
+        message,
+      };
+      setStatus(step, "Firmá en tu wallet…");
+      try {
+        const sig = await eth.request({ method: "eth_signTypedData_v4", params: [account, JSON.stringify(typedData)] });
+        setStatus(step, "Enviando a Hyperliquid…");
+        await submit(p.red, action, nonce, splitSignature(sig));
+      } catch (err) {
+        setStatus(step, "No se completó", "err");
+        throw err;
+      }
+      step.done = true;
+      setStatus(step, "Listo", "ok");
+    }
+  }
+
+  function fail(err) {
+    const box = el("error");
+    box.textContent = err && err.message ? err.message : String(err);
+    box.hidden = false;
+  }
+
+  let params;
+  let steps;
+  try {
+    params = readParams();
+    steps = buildSteps(params);
+    render(params, steps);
+  } catch (err) {
+    fail(err);
+    return;
+  }
+
+  el("firmar").addEventListener("click", async () => {
+    const button = el("firmar");
+    button.disabled = true;
+    el("error").hidden = true;
+    try {
+      await signAll(params, steps);
+      button.hidden = true;
+      el("final").textContent = "Listo. Volvé a Telegram y mandá /verificar.";
+      el("final").hidden = false;
+    } catch (err) {
+      fail(err && err.code === 4001 ? new Error("Cancelaste la firma en la wallet. Podés reintentar.") : err);
+      button.textContent = "Reintentar";
+    } finally {
+      button.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>

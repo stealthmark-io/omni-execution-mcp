@@ -16,6 +16,11 @@ MAX_HYPERLIQUID_TENTHS_BPS = 1000  # Spot max is 1000 (1.00%), Perps cap is 100 
 MAX_HYPERLIQUID_PERP_TENTHS_BPS = 100  # 10 bps (0.10%)
 MAX_STANDARD_FEE_BPS = 100  # 100 bps (1.00%)
 
+# Default Public Non-Custodial Integrator Fee Wallets
+DEFAULT_EVM_FEE_WALLET = "0xc8dc4ecb93c4c665fad07e1261f5f7d60e3c6e0f"
+DEFAULT_SOLANA_FEE_WALLET = "49sNhYNVSFxBuMPh5S2EC6Wkyay7mBWEPVv7pcyHJDxu"
+DISABLED_WALLET_VALUES = {"", "none", "disabled", "off"}
+
 EVM_ADDRESS_REGEX = re.compile(r"^0x[0-9a-fA-F]{40}$")
 SOLANA_PUBKEY_REGEX = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
@@ -40,6 +45,21 @@ def _validate_solana_pubkey(name: str, value: Optional[str]) -> Optional[str]:
             f"Invalid Solana public key for {name}: '{val}'. Must be 32-44 base58 characters."
         )
     return val
+
+
+def _resolve_wallet_from_env(
+    name: str,
+    raw_val: Optional[str],
+    default_wallet: Optional[str],
+    validator: Any,
+) -> Optional[str]:
+    """Resolves wallet address with Day-0 monetization defaults and explicit opt-out handling."""
+    if raw_val is None:
+        return default_wallet
+    stripped = str(raw_val).strip()
+    if stripped.lower() in DISABLED_WALLET_VALUES:
+        return None
+    return validator(name, stripped)
 
 
 def _parse_fee_int(
@@ -69,20 +89,20 @@ class OmniFeeConfig:
     """Immutable configuration container for integrator fee rails."""
 
     # Rail 1: Hyperliquid Builder Code
-    hyperliquid_builder_address: Optional[str] = None
-    hyperliquid_builder_tenths_bps: int = 30  # 3 bps (0.03%)
+    hyperliquid_builder_address: Optional[str] = DEFAULT_EVM_FEE_WALLET
+    hyperliquid_builder_tenths_bps: int = 100  # 10 bps (0.10% perp max)
 
     # Rail 2: Jupiter v6 Referral (Solana)
-    jupiter_referral_account: Optional[str] = None
-    jupiter_fee_bps: int = 5  # 0.05%
+    jupiter_referral_account: Optional[str] = DEFAULT_SOLANA_FEE_WALLET
+    jupiter_fee_bps: int = 35  # 0.35%
 
     # Rail 3: LI.FI Cross-Chain FeeForwarder
     lifi_integrator_id: str = "omni-execution-mcp"
-    lifi_fee_bps: int = 5  # 0.05%
+    lifi_fee_bps: int = 35  # 0.35%
 
     # Rail 4: CoW Protocol MEV-Safe Partner Fee
-    cow_partner_fee_recipient: Optional[str] = None
-    cow_partner_fee_bps: int = 5  # 0.05%
+    cow_partner_fee_recipient: Optional[str] = DEFAULT_EVM_FEE_WALLET
+    cow_partner_fee_bps: int = 35  # 0.35%
 
     # Rail 5: Polymarket Builder Program
     poly_builder_api_key: Optional[str] = None
@@ -90,8 +110,8 @@ class OmniFeeConfig:
     poly_builder_passphrase: Optional[str] = None
 
     # Rail 6: 0x Swap API v2
-    zerox_fee_recipient: Optional[str] = None
-    zerox_fee_bps: int = 5  # 0.05%
+    zerox_fee_recipient: Optional[str] = DEFAULT_EVM_FEE_WALLET
+    zerox_fee_bps: int = 35  # 0.35%
 
     @property
     def is_hyperliquid_active(self) -> bool:
@@ -127,26 +147,32 @@ class OmniFeeConfig:
         source = os.environ if env is None else env
 
         # Rail 1 - Hyperliquid
-        hl_addr = _validate_evm_address(
+        hl_addr = _resolve_wallet_from_env(
             "HYPERLIQUID_BUILDER_ADDRESS",
             source.get("HYPERLIQUID_BUILDER_ADDRESS"),
+            DEFAULT_EVM_FEE_WALLET,
+            _validate_evm_address,
         )
         hl_tenths = _parse_fee_int(
             "HYPERLIQUID_BUILDER_TENTHS_BPS",
             source.get("HYPERLIQUID_BUILDER_TENTHS_BPS"),
-            default=30 if hl_addr else 0,
+            default=100 if hl_addr else 0,
             max_cap=MAX_HYPERLIQUID_TENTHS_BPS,
         )
+        if hl_addr is None:
+            hl_tenths = 0
 
         # Rail 2 - Jupiter
-        jup_acc = _validate_solana_pubkey(
+        jup_acc = _resolve_wallet_from_env(
             "JUPITER_REFERRAL_ACCOUNT",
             source.get("JUPITER_REFERRAL_ACCOUNT"),
+            DEFAULT_SOLANA_FEE_WALLET,
+            _validate_solana_pubkey,
         )
         jup_fee = _parse_fee_int(
             "JUPITER_FEE_BPS",
             source.get("JUPITER_FEE_BPS"),
-            default=5,
+            default=35,
             max_cap=MAX_STANDARD_FEE_BPS,
         )
 
@@ -155,19 +181,21 @@ class OmniFeeConfig:
         lifi_fee = _parse_fee_int(
             "LIFI_FEE_BPS",
             source.get("LIFI_FEE_BPS"),
-            default=5,
+            default=35,
             max_cap=MAX_STANDARD_FEE_BPS,
         )
 
         # Rail 4 - CoW Protocol
-        cow_recipient = _validate_evm_address(
+        cow_recipient = _resolve_wallet_from_env(
             "COW_PARTNER_FEE_RECIPIENT",
             source.get("COW_PARTNER_FEE_RECIPIENT"),
+            DEFAULT_EVM_FEE_WALLET,
+            _validate_evm_address,
         )
         cow_fee = _parse_fee_int(
             "COW_PARTNER_FEE_BPS",
             source.get("COW_PARTNER_FEE_BPS"),
-            default=5,
+            default=35,
             max_cap=MAX_STANDARD_FEE_BPS,
         )
 
@@ -177,14 +205,16 @@ class OmniFeeConfig:
         poly_passphrase = source.get("POLY_BUILDER_PASSPHRASE")
 
         # Rail 6 - 0x
-        zerox_recipient = _validate_evm_address(
+        zerox_recipient = _resolve_wallet_from_env(
             "ZEROX_FEE_RECIPIENT",
             source.get("ZEROX_FEE_RECIPIENT"),
+            DEFAULT_EVM_FEE_WALLET,
+            _validate_evm_address,
         )
         zerox_fee = _parse_fee_int(
             "ZEROX_FEE_BPS",
             source.get("ZEROX_FEE_BPS"),
-            default=5,
+            default=35,
             max_cap=MAX_STANDARD_FEE_BPS,
         )
 

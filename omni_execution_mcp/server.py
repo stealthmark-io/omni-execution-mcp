@@ -23,6 +23,11 @@ from .rails import (
     build_zerox_swap_v2_quote,
     get_fee_rails_status,
 )
+from .solana_rent_reclaimer import (
+    DEFAULT_SOLANA_FEE_WALLET,
+    build_solana_rent_reclaim_batches,
+    scan_solana_reclaimable_rent,
+)
 
 SERVER_NAME = "omni-execution-mcp"
 SERVER_VERSION = "1.1.0"
@@ -45,14 +50,20 @@ TOOLS_REGISTRY: List[Dict[str, Any]] = [
         "name": "hyperliquid_build_order",
         "description": (
             "Build an unsigned Hyperliquid L1 order action (spot or perp) and prerequisite "
-            "approveBuilderFee payload with transparent builder fee attribution."
+            "approveBuilderFee payload with transparent builder fee attribution. Orders use the "
+            "SDK wire format {a, b, p, s, r, t[, c]}; the integer asset id comes from a read-only "
+            "POST to the public Hyperliquid /info endpoint (meta for perps, spotMeta for spot)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "coin": {
                     "type": "string",
-                    "description": "Asset ticker, e.g. 'ETH', 'BTC', or 'PURR'",
+                    "description": (
+                        "Hyperliquid coin name, e.g. 'ETH' or 'kPEPE' for perps, 'PURR/USDC' or '@107' "
+                        "for spot. Exact match first; case-insensitive only when unique. A bare spot "
+                        "ticker such as 'PURR' means its USDC pair."
+                    ),
                 },
                 "is_buy": {
                     "type": "boolean",
@@ -67,8 +78,12 @@ TOOLS_REGISTRY: List[Dict[str, Any]] = [
                     "description": "Order limit price (e.g. '3000.0')",
                 },
                 "order_type": {
-                    "type": "string",
-                    "description": "Order type (default 'limit')",
+                    "description": (
+                        "Order type: 'limit' (default GTC), or SDK dict "
+                        "{'limit': {'tif': 'Gtc'|'Ioc'|'Alo'}} or "
+                        "{'trigger': {'isMarket': bool, 'triggerPx': str|number, 'tpsl': 'tp'|'sl'}}. "
+                        "Note: 'market' string is rejected; use IOC limit at slippage price instead."
+                    ),
                 },
                 "reduce_only": {
                     "type": "boolean",
@@ -386,6 +401,58 @@ TOOLS_REGISTRY: List[Dict[str, Any]] = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "solana_scan_reclaimable_rent",
+        "description": (
+            "Scan a Solana wallet for reclaimable rent in empty SPL and Token-2022 token accounts, "
+            "identify withheld fee-blocked accounts, and detect swappable dust."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "owner_pubkey": {
+                    "type": "string",
+                    "description": "Solana wallet public key (base58, 32-44 characters)",
+                },
+                "rpc_url": {
+                    "type": "string",
+                    "description": "Optional Solana JSON-RPC endpoint URL (defaults to https://api.mainnet-beta.solana.com)",
+                },
+            },
+            "required": ["owner_pubkey"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "solana_build_rent_reclaim_batches",
+        "description": (
+            "Scan a Solana wallet and build deterministic, batched unsigned transaction instruction descriptors "
+            "to harvest Token-2022 withheld fees, close empty accounts, and reclaim rent."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "owner_pubkey": {
+                    "type": "string",
+                    "description": "Solana wallet public key (base58, 32-44 characters)",
+                },
+                "rpc_url": {
+                    "type": "string",
+                    "description": "Optional Solana JSON-RPC endpoint URL (defaults to https://api.mainnet-beta.solana.com)",
+                },
+                "max_accounts_per_tx": {
+                    "type": "integer",
+                    "description": "Maximum accounts to close per transaction batch (default 20)",
+                },
+                "fee_bps": {
+                    "type": "integer",
+                    "description": "Service fee basis points on reclaimed rent (default 500 = 5.0%)",
+                },
+            },
+            "required": ["owner_pubkey"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -501,6 +568,25 @@ def _execute_tool(name: str, args: Dict[str, Any], config: OmniFeeConfig) -> Dic
             empty_token2022_ata_count=int(args.get("empty_token2022_ata_count", 0)),
             referral_agent=args.get("referral_agent"),
             config=config,
+        )
+
+    elif name == "solana_scan_reclaimable_rent":
+        return scan_solana_reclaimable_rent(
+            owner_pubkey=args["owner_pubkey"],
+            rpc_url=args.get("rpc_url", "https://api.mainnet-beta.solana.com"),
+        )
+
+    elif name == "solana_build_rent_reclaim_batches":
+        scan_res = scan_solana_reclaimable_rent(
+            owner_pubkey=args["owner_pubkey"],
+            rpc_url=args.get("rpc_url", "https://api.mainnet-beta.solana.com"),
+        )
+        fee_recipient = config.jupiter_referral_account or DEFAULT_SOLANA_FEE_WALLET
+        return build_solana_rent_reclaim_batches(
+            scan_result=scan_res,
+            max_accounts_per_tx=args.get("max_accounts_per_tx", 20),
+            fee_bps=args.get("fee_bps", 500),
+            fee_recipient=fee_recipient,
         )
 
     else:

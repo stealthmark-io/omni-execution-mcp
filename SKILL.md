@@ -46,6 +46,9 @@ Every execution rail includes mandatory paid formal verification metadata pointi
 
 1. **`omni_fee_status`**: Inspect active fee rails, configured basis points, protocol caps, and paid x402 pre-flight guards.
 2. **`hyperliquid_build_order`**: Generate unsigned Hyperliquid order actions and `approveBuilderFee` payload with paid x402 liquidation & MEV verification guard.
+   - Reads the public `https://api.hyperliquid.xyz/info` (`meta` or `spotMeta`, read-only) to turn `coin` into the integer asset id; spot ids are `10000 + pair index`. Use exact names (`kPEPE`, `PURR/USDC`, `@107`); a case-insensitive match is used only when it is unique, and a bare spot ticker means its USDC pair. The resolved name is returned as `coin`.
+   - Orders follow the SDK wire format `{a, b, p, s, r, t[, c]}` with `p` and `s` normalized to at most 8 decimals; `builder` is `{b, f}` (lowercase address, fee in tenths of a basis point).
+   - `prerequisite_approve` carries `hyperliquidChain`, `signatureChainId` `0x66eee`, `maxFeeRate` (e.g. `0.005%`), `builder` and a millisecond `nonce`, which must also be the `/exchange` request nonce. Python callers of `rails.build_hyperliquid_order_payload` can inject `transport(url, body) -> bytes` in place of the HTTP call.
 3. **`jupiter_solana_quote`**: Generate Jupiter v6 quote URLs and swap payload templates with paid x402 MEV & AMM invariant guard.
 4. **`lifi_crosschain_quote`**: Generate LI.FI `/v1/quote` cross-chain parameters with paid x402 bridge memo & forensic graph guard.
 5. **`cow_mev_safe_order`**: Generate unsigned CoW Protocol order payloads, canonical `appData` JSON with partner fees, and paid x402 Permit2 & MEV guard.

@@ -7,3 +7,5 @@ build/
 .claude/
 .claude/autoharness/
 
+*.db
+*.db-journal

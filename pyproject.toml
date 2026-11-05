@@ -40,9 +40,16 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+bot = ["hyperliquid-python-sdk>=0.24,<0.25"]
+
 [project.urls]
 Homepage = "https://gateway.stealthmark.io/x402/catalog"
 Repository = "https://github.com/stealthmark-io/omni-execution-mcp"
 
 [project.scripts]
 omni-execution-mcp = "omni_execution_mcp.server:main"
+omni-builder-bot = "omni_execution_mcp.builder_bot.bot:main"
+
+[tool.setuptools.package-data]
+"omni_execution_mcp.builder_bot" = ["static/*.html"]

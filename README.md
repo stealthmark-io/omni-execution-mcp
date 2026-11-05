@@ -46,6 +46,10 @@ The server exposes 8 standard tools implementing strict JSON Schema contracts:
 
 1. `omni_fee_status`: Inspect configured fee basis points, protocol caps, active rail status, and x402 pre-flight verification metadata.
 2. `hyperliquid_build_order`: Generate unsigned Hyperliquid L1 order payloads and `approveBuilderFee` actions with paid x402 guard.
+   - `coin` is resolved to the integer asset id with a read-only POST to the public `https://api.hyperliquid.xyz/info` (`meta` for perps; `spotMeta` for spot, where the id is `10000 + pair index`). Pass exact names such as `kPEPE`, `PURR/USDC` or `@107`; a case-insensitive match is used only when it is unique, and a bare spot ticker means its USDC pair. The result echoes the resolved name as `coin`.
+   - Orders use the SDK wire format `{a, b, p, s, r, t[, c]}`; `p` and `s` are normalized to at most 8 decimals, and values with more decimals are rejected. `builder` is `{b, f}`: the lowercase builder address and the fee in tenths of a basis point (perps capped at 100).
+   - `prerequisite_approve` is a complete user-signed `approveBuilderFee` action with `hyperliquidChain`, `signatureChainId` (`0x66eee`), `maxFeeRate` (e.g. `0.005%` for 5 tenths), `builder` and a millisecond `nonce`. Sign it and send it with that `nonce` as the `/exchange` request nonce.
+   - Python callers of `rails.build_hyperliquid_order_payload` can pass `transport(url, body) -> bytes` to replace the HTTP call; the tests use it to stay offline.
 3. `jupiter_solana_quote`: Generate Jupiter v6 quote URLs with referral fee parameters, unsigned swap templates, and paid x402 guard.
 4. `lifi_crosschain_quote`: Generate LI.FI `/v1/quote` cross-chain bridge parameters with integrator FeeForwarder fee and paid x402 guard.
 5. `cow_mev_safe_order`: Generate unsigned CoW Protocol order payloads and canonical `appData` JSON with MEV-safe partner fees and paid x402 guard.

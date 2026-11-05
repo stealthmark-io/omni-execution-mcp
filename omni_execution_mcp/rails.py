@@ -12,11 +12,13 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Optional, Union
+from decimal import Decimal
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 from .config import (
     EVM_ADDRESS_REGEX,
@@ -75,10 +77,14 @@ X402_CORRIDOR_ROUTES: Dict[str, Any] = {
 
 
 def _validate_positive_amount(name: str, value: Union[int, float, str]) -> str:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a valid positive number, got {value}")
     try:
         val_float = float(value)
     except (ValueError, TypeError):
         raise ValueError(f"{name} must be a valid positive number, got {value}")
+    if not math.isfinite(val_float):
+        raise ValueError(f"{name} must be a finite positive number, got {value}")
     if val_float <= 0:
         raise ValueError(f"{name} must be greater than 0, got {value}")
     return str(value)
@@ -363,6 +369,8 @@ def build_x402_preflight_guard(
     return {
         "status": "HTTP 402 Payment Required",
         "protocol": "x402",
+        "mode": "OPTIONAL_ADVISORY",
+        "blocking": False,
         "rail": rail_norm,
         "preflight_guard": "STRICT_PAID_ONLY",
         "primary_gateway": X402_PRIMARY_GATEWAY,
@@ -383,6 +391,118 @@ def build_x402_preflight_guard(
 # ============================================================================
 # Rail 1: Hyperliquid Builder Code (Perps & Spot)
 # ============================================================================
+HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz"
+_HYPERLIQUID_WIRE_QUANT = Decimal("0.00000001")
+_HYPERLIQUID_WIRE_TOLERANCE = Decimal("1e-12")
+
+
+def _hyperliquid_post(url: str, body: bytes) -> bytes:
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": "omni-execution-mcp/1.0"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5.0) as resp:
+        return resp.read()
+
+
+def _hyperliquid_float_to_wire(name: str, value: Union[float, str, int, Decimal]) -> str:
+    """Mirrors the Hyperliquid SDK float_to_wire: 8 decimals max, normalized, no exponent."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a valid number, got {value}")
+    try:
+        exact = Decimal(str(value))
+    except Exception as exc:
+        raise ValueError(f"{name} must be a valid number, got {value}") from exc
+    if not exact.is_finite() or exact <= 0:
+        raise ValueError(f"{name} must be a finite positive number, got {value}")
+    rounded = exact.quantize(_HYPERLIQUID_WIRE_QUANT)
+    if abs(rounded - exact) >= _HYPERLIQUID_WIRE_TOLERANCE:
+        raise ValueError(f"{name} has more than 8 decimals, which Hyperliquid rejects: {value}")
+    return format(rounded.normalize(), "f")
+
+
+def _hyperliquid_order_type_to_wire(order_type: Union[dict, str]) -> Dict[str, Any]:
+    """Mirrors hyperliquid.utils.signing.order_type_to_wire with wire price normalization
+    and strict input validation.
+    """
+    if order_type == "limit":
+        return {"limit": {"tif": "Gtc"}}
+
+    if isinstance(order_type, dict) and set(order_type.keys()) == {"limit"} and isinstance(order_type["limit"], dict):
+        limit = order_type["limit"]
+        tif = limit.get("tif")
+        if set(limit.keys()) == {"tif"} and tif in ("Alo", "Ioc", "Gtc"):
+            return {"limit": {"tif": tif}}
+        raise ValueError(
+            f"Invalid Hyperliquid limit order_type {order_type!r}; tif must be 'Alo', 'Ioc', or 'Gtc'"
+        )
+
+    if isinstance(order_type, dict) and set(order_type.keys()) == {"trigger"} and isinstance(order_type["trigger"], dict):
+        trigger = order_type["trigger"]
+        if set(trigger.keys()) != {"isMarket", "triggerPx", "tpsl"}:
+            raise ValueError(
+                f"Invalid Hyperliquid trigger order_type keys: {set(trigger.keys())}; expected {{'isMarket', 'triggerPx', 'tpsl'}}"
+            )
+        is_market = trigger["isMarket"]
+        if not isinstance(is_market, bool):
+            raise ValueError(f"trigger order isMarket must be a bool, got {type(is_market).__name__}")
+        tpsl = trigger["tpsl"]
+        if tpsl not in ("tp", "sl"):
+            raise ValueError(f"trigger order tpsl must be 'tp' or 'sl', got {tpsl!r}")
+        _validate_positive_amount("triggerPx", trigger["triggerPx"])
+        wire_trigger_px = _hyperliquid_float_to_wire("triggerPx", trigger["triggerPx"])
+        return {
+            "trigger": {
+                "isMarket": is_market,
+                "triggerPx": wire_trigger_px,
+                "tpsl": tpsl,
+            }
+        }
+
+    raise ValueError(
+        f"Unsupported Hyperliquid order_type {order_type!r}; use 'limit', "
+        f"{{'limit': {{'tif': 'Gtc'|'Ioc'|'Alo'}}}}, or "
+        f"{{'trigger': {{'isMarket': bool, 'triggerPx': px, 'tpsl': 'tp'|'sl'}}}}"
+    )
+
+
+def _resolve_hyperliquid_asset(meta: Dict[str, Any], coin: str, is_spot: bool) -> Tuple[int, str]:
+    """Returns (asset, name): perps use the index in meta["universe"] (delisted entries
+    included); spot uses 10000 + pair index and also accepts BASE/QUOTE or a bare BASE for its
+    USDC pair. Exact names win; a case-insensitive match is accepted only when unique."""
+    wanted = coin.strip()
+    if is_spot:
+        if "/" not in wanted and not wanted.startswith("@"):
+            wanted = f"{wanted}/USDC"
+        tokens = {token["index"]: token for token in meta["tokens"]}
+        candidates = [
+            (
+                10000 + pair["index"],
+                pair["name"],
+                {
+                    pair["name"],
+                    f"{tokens[pair['tokens'][0]]['name']}/{tokens[pair['tokens'][1]]['name']}",
+                },
+            )
+            for pair in meta["universe"]
+        ]
+    else:
+        candidates = [
+            (index, entry["name"], {entry["name"]})
+            for index, entry in enumerate(meta["universe"])
+            if not entry.get("isDelisted")
+        ]
+    exact = [c for c in candidates if wanted in c[2]]
+    folded = [c for c in candidates if wanted.lower() in {alias.lower() for alias in c[2]}]
+    for matches in (exact, folded):
+        if len(matches) == 1:
+            return matches[0][0], matches[0][1]
+    market = "spot" if is_spot else "perp"
+    raise ValueError(f"Unknown or ambiguous Hyperliquid {market} coin: {coin}")
+
+
 def build_hyperliquid_order_payload(
     coin: str,
     is_buy: bool,
@@ -394,12 +514,18 @@ def build_hyperliquid_order_payload(
     cloid: Optional[str] = None,
     referral_agent: Optional[str] = None,
     config: Optional[OmniFeeConfig] = None,
+    transport: Optional[Callable[[str, bytes], bytes]] = None,
 ) -> Dict[str, Any]:
-    """Builds an unsigned Hyperliquid /exchange order action with optional builder attribution."""
+    """Builds an unsigned Hyperliquid /exchange order action with optional builder attribution.
+
+    The integer asset index is read from the public /info endpoint ("meta" for perps,
+    "spotMeta" for spot). ``transport(url, body) -> bytes`` replaces the HTTP POST.
+    """
     cfg = config or OmniFeeConfig.from_env()
 
     _validate_positive_amount("sz (size)", sz)
     _validate_positive_amount("px (price)", px)
+    formatted_order_type = _hyperliquid_order_type_to_wire(order_type)
 
     if not coin or not isinstance(coin, str):
         raise ValueError("coin must be a non-empty string, e.g. 'ETH' or 'BTC'")
@@ -426,43 +552,38 @@ def build_hyperliquid_order_payload(
             "b": builder_addr,
             "f": tenths_bps,
         }
-        # Pre-requisite one-time approval action
-        # e.g., 30 tenths of bps -> 0.03%
-        fee_rate_str = f"{(tenths_bps / 1000):.2f}%"
+        # Pre-requisite one-time approval action (user-signed; send it with nonce as the request nonce)
+        # e.g., 30 tenths of bps -> 0.03%, 5 -> 0.005%
         prerequisite_approve = {
             "type": "approveBuilderFee",
+            "hyperliquidChain": "Mainnet",
+            "signatureChainId": "0x66eee",
+            "maxFeeRate": f"{(Decimal(tenths_bps) / 1000).normalize():f}%",
             "builder": builder_addr,
-            "maxFeeRate": fee_rate_str,
+            "nonce": int(time.time() * 1000),
         }
 
-    formatted_order_type = (
-        {"limit": {"tif": "Gtc"}} if order_type == "limit" else order_type
-    )
+    wire_px = _hyperliquid_float_to_wire("px (price)", px)
+    wire_sz = _hyperliquid_float_to_wire("sz (size)", sz)
 
-    order_spec = {
-        "coin": coin.upper(),
-        "is_buy": is_buy,
-        "sz": str(sz),
-        "px": str(px),
-        "reduce_only": reduce_only,
-        "order_type": formatted_order_type,
+    info_body = json.dumps({"type": "spotMeta" if is_spot else "meta"}).encode("utf-8")
+    meta = json.loads((transport or _hyperliquid_post)(f"{HYPERLIQUID_API_URL}/info", info_body))
+    asset, resolved_coin = _resolve_hyperliquid_asset(meta, coin, is_spot)
+
+    order_wire: Dict[str, Any] = {
+        "a": asset,
+        "b": is_buy,
+        "p": wire_px,
+        "s": wire_sz,
+        "r": reduce_only,
+        "t": formatted_order_type,
     }
     if cloid:
-        order_spec["cloid"] = cloid
+        order_wire["c"] = cloid
 
     action: Dict[str, Any] = {
         "type": "order",
-        "orders": [
-            {
-                "coin": coin.upper(),
-                "b": is_buy,
-                "p": str(px),
-                "s": str(sz),
-                "r": reduce_only,
-                "t": formatted_order_type,
-                **({"c": cloid} if cloid else {}),
-            }
-        ],
+        "orders": [order_wire],
         "grouping": "na",
     }
 
@@ -472,7 +593,8 @@ def build_hyperliquid_order_payload(
     return {
         "rail": "hyperliquid",
         "market_type": "spot" if is_spot else "perp",
-        "endpoint": "https://api.hyperliquid.xyz/exchange",
+        "coin": resolved_coin,
+        "endpoint": f"{HYPERLIQUID_API_URL}/exchange",
         "action": action,
         "prerequisite_approve_builder_fee": prerequisite_approve,
         "fee_attribution": {
@@ -486,6 +608,13 @@ def build_hyperliquid_order_payload(
         "x402_preflight_verification": build_x402_preflight_guard(
             "hyperliquid", referral_agent=referral_agent
         ),
+        "x402_preflight": {
+            "mode": "OPTIONAL_ADVISORY",
+            "blocking": False,
+            "verification": build_x402_preflight_guard(
+                "hyperliquid", referral_agent=referral_agent
+            ),
+        },
         "non_custodial_notice": NON_CUSTODIAL_NOTICE,
     }
 
@@ -569,6 +698,13 @@ def build_jupiter_quote_request(
         "x402_preflight_verification": build_x402_preflight_guard(
             "jupiter", referral_agent=referral_agent
         ),
+        "x402_preflight": {
+            "mode": "OPTIONAL_ADVISORY",
+            "blocking": False,
+            "verification": build_x402_preflight_guard(
+                "jupiter", referral_agent=referral_agent
+            ),
+        },
         "non_custodial_notice": NON_CUSTODIAL_NOTICE,
     }
 
@@ -628,6 +764,13 @@ def build_lifi_bridge_quote(
         "x402_preflight_verification": build_x402_preflight_guard(
             "lifi", referral_agent=referral_agent
         ),
+        "x402_preflight": {
+            "mode": "OPTIONAL_ADVISORY",
+            "blocking": False,
+            "verification": build_x402_preflight_guard(
+                "lifi", referral_agent=referral_agent
+            ),
+        },
         "non_custodial_notice": NON_CUSTODIAL_NOTICE,
     }
 
@@ -737,6 +880,13 @@ def build_cow_swap_order(
         "x402_preflight_verification": build_x402_preflight_guard(
             "cow_protocol", referral_agent=referral_agent
         ),
+        "x402_preflight": {
+            "mode": "OPTIONAL_ADVISORY",
+            "blocking": False,
+            "verification": build_x402_preflight_guard(
+                "cow_protocol", referral_agent=referral_agent
+            ),
+        },
         "non_custodial_notice": NON_CUSTODIAL_NOTICE,
     }
 
@@ -821,6 +971,13 @@ def build_polymarket_builder_request(
         "x402_preflight_verification": build_x402_preflight_guard(
             "polymarket", referral_agent=referral_agent
         ),
+        "x402_preflight": {
+            "mode": "OPTIONAL_ADVISORY",
+            "blocking": False,
+            "verification": build_x402_preflight_guard(
+                "polymarket", referral_agent=referral_agent
+            ),
+        },
         "non_custodial_notice": NON_CUSTODIAL_NOTICE,
     }
 
@@ -877,6 +1034,13 @@ def build_zerox_swap_v2_quote(
         "x402_preflight_verification": build_x402_preflight_guard(
             "zerox_v2", referral_agent=referral_agent
         ),
+        "x402_preflight": {
+            "mode": "OPTIONAL_ADVISORY",
+            "blocking": False,
+            "verification": build_x402_preflight_guard(
+                "zerox_v2", referral_agent=referral_agent
+            ),
+        },
         "non_custodial_notice": NON_CUSTODIAL_NOTICE,
     }
 
@@ -981,6 +1145,8 @@ def get_fee_rails_status(
         "x402_preflight_verification": {
             "status": "HTTP 402 Payment Required",
             "protocol": "x402",
+            "mode": "OPTIONAL_ADVISORY",
+            "blocking": False,
             "primary_gateway": X402_PRIMARY_GATEWAY,
             "backup_gateway": X402_BACKUP_GATEWAY,
             "settlement_wallet": X402_SETTLEMENT_WALLET,
@@ -1017,6 +1183,7 @@ def build_polymarket_hyperliquid_hedge_bundle(
     hyperliquid_px: Union[float, str],
     referral_agent: Optional[str] = None,
     config: Optional[OmniFeeConfig] = None,
+    transport: Optional[Callable[[str, bytes], bytes]] = None,
 ) -> Dict[str, Any]:
     """Builds a synchronized Polymarket CLOB order + Hyperliquid Perp delta-hedge bundle
     gated by x402 Z3 formal verification (/x402/verify-polymarket-basket & /x402/verify-liquidation-waterfall).
@@ -1038,6 +1205,7 @@ def build_polymarket_hyperliquid_hedge_bundle(
         is_spot=False,
         referral_agent=referral_agent,
         config=cfg,
+        transport=transport,
     )
     poly_notional = float(polymarket_price) * float(polymarket_size)
     hl_notional = float(hyperliquid_px) * float(hyperliquid_sz)
@@ -1065,6 +1233,13 @@ def build_polymarket_hyperliquid_hedge_bundle(
                 f"npx -y agentcash@latest fetch {X402_PRIMARY_GATEWAY}/x402/verify-polymarket-basket",
                 f"npx -y agentcash@latest fetch {X402_PRIMARY_GATEWAY}/x402/verify-liquidation-waterfall",
             ],
+        },
+        "x402_preflight": {
+            "mode": "OPTIONAL_ADVISORY",
+            "blocking": False,
+            "verification": build_x402_preflight_guard(
+                "polymarket", referral_agent=referral_agent
+            ),
         },
     }
 
@@ -1121,6 +1296,13 @@ def build_solana_rent_reclaim_bundle(
         "x402_preflight_verification": build_x402_preflight_guard(
             "jupiter", referral_agent=referral_agent
         ),
+        "x402_preflight": {
+            "mode": "OPTIONAL_ADVISORY",
+            "blocking": False,
+            "verification": build_x402_preflight_guard(
+                "jupiter", referral_agent=referral_agent
+            ),
+        },
         "non_custodial_notice": NON_CUSTODIAL_NOTICE,
     }
 

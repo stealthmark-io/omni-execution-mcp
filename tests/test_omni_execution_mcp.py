@@ -18,10 +18,14 @@ import base64
 import hashlib
 import hmac
 import json
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from omni_execution_mcp.config import (
+    DEFAULT_EVM_FEE_WALLET,
+    DEFAULT_SOLANA_FEE_WALLET,
     MAX_HYPERLIQUID_PERP_TENTHS_BPS,
     MAX_HYPERLIQUID_TENTHS_BPS,
     OmniFeeConfig,
@@ -55,10 +59,47 @@ DUMMY_SOLANA_KEY = "11111111111111111111111111111111"
 SYNTHETIC_POLY_KEY = "test-builder-key-12345"
 SYNTHETIC_POLY_SECRET = base64.b64encode(b"synthetic-secret-32-byte-string-!").decode("utf-8")
 SYNTHETIC_POLY_PASSPHRASE = "test-passphrase-alpha"
+DUMMY_EVM_MIXED_CASE = "0x" + "0" * 36 + "AbCd"
+
+# Offline Hyperliquid /info fixtures: "meta" for perps, "spotMeta" for spot
+HL_INFO_URL = "https://api.hyperliquid.xyz/info"
+HL_META = {
+    "universe": [
+        {"name": "BTC", "szDecimals": 5},
+        {"name": "ETH", "szDecimals": 4},
+        {"name": "OLD", "szDecimals": 2, "isDelisted": True},
+        {"name": "kPEPE", "szDecimals": 0},
+    ]
+}
+HL_SPOT_META = {
+    "tokens": [
+        {"name": "USDC", "index": 0, "szDecimals": 8},
+        {"name": "PURR", "index": 1, "szDecimals": 0},
+        {"name": "HYPE", "index": 2, "szDecimals": 2},
+    ],
+    "universe": [
+        {"name": "PURR/USDC", "tokens": [1, 0], "index": 0},
+        {"name": "@1", "tokens": [2, 0], "index": 1},
+    ],
+}
+
+
+def fake_hl_transport(url: str, body: bytes) -> bytes:
+    if url != HL_INFO_URL:
+        raise AssertionError(f"unexpected Hyperliquid URL: {url}")
+    fixture = {"meta": HL_META, "spotMeta": HL_SPOT_META}[json.loads(body)["type"]]
+    return json.dumps(fixture).encode("utf-8")
 
 
 class TestOmniExecutionMCP(unittest.TestCase):
     def setUp(self):
+        offline = mock.patch(
+            "urllib.request.urlopen",
+            side_effect=AssertionError("unit tests must not open network connections"),
+        )
+        offline.start()
+        self.addCleanup(offline.stop)
+
         self.empty_config = OmniFeeConfig(
             hyperliquid_builder_address=None,
             hyperliquid_builder_tenths_bps=0,
@@ -124,7 +165,7 @@ class TestOmniExecutionMCP(unittest.TestCase):
         msg = {"jsonrpc": "2.0", "id": 4, "method": "tools/list"}
         res = handle_jsonrpc_message(msg, config=self.empty_config)
         tools = res["result"]["tools"]
-        self.assertEqual(len(tools), 10)
+        self.assertEqual(len(tools), 12)
 
         expected_names = {
             "omni_fee_status",
@@ -137,6 +178,8 @@ class TestOmniExecutionMCP(unittest.TestCase):
             "x402_preflight_guard",
             "polymarket_hyperliquid_hedge_bundle",
             "solana_rent_reclaim_bundle",
+            "solana_scan_reclaimable_rent",
+            "solana_build_rent_reclaim_batches",
         }
         found_names = {t["name"] for t in tools}
         self.assertEqual(expected_names, found_names)
@@ -197,6 +240,7 @@ class TestOmniExecutionMCP(unittest.TestCase):
             px="3200.0",
             is_spot=False,
             config=self.full_config,
+            transport=fake_hl_transport,
         )
         self.assertEqual(order["rail"], "hyperliquid")
         action = order["action"]
@@ -241,6 +285,7 @@ class TestOmniExecutionMCP(unittest.TestCase):
             px="0.25",
             is_spot=True,
             config=spot_fee_cfg,
+            transport=fake_hl_transport,
         )
         self.assertEqual(order["action"]["builder"]["f"], 500)
         self.assertEqual(order["market_type"], "spot")
@@ -618,7 +663,8 @@ class TestOmniExecutionMCP(unittest.TestCase):
                 },
             },
         }
-        res = handle_jsonrpc_message(msg, config=self.full_config)
+        with mock.patch("omni_execution_mcp.rails._hyperliquid_post", side_effect=fake_hl_transport):
+            res = handle_jsonrpc_message(msg, config=self.full_config)
         assert res is not None
         self.assertFalse(res["result"]["isError"])
         payload = json.loads(res["result"]["content"][0]["text"])
@@ -648,6 +694,252 @@ class TestOmniExecutionMCP(unittest.TestCase):
         self.assertEqual(payload["total_accounts_to_close"], 50)
         self.assertEqual(payload["versioned_v0_batches"], 3)
         self.assertTrue(payload["token2022_extension_guard"]["requires_harvest_withheld_to_mint"])
+
+    # --------------------------------------------------------------------------
+    # Rail 1: Hyperliquid wire format (offline /info fixtures)
+    # --------------------------------------------------------------------------
+    def _hl_build(self, coin, **overrides):
+        kwargs = {
+            "is_buy": True,
+            "sz": "1",
+            "px": "1",
+            "config": self.empty_config,
+            "transport": fake_hl_transport,
+        }
+        kwargs.update(overrides)
+        return build_hyperliquid_order_payload(coin=coin, **kwargs)
+
+    def test_28_hyperliquid_order_wire_matches_sdk(self):
+        cloid = "0x" + "00" * 15 + "2a"
+        order = self._hl_build(
+            "ETH", sz="1.5", px="3200.0", cloid=cloid, config=self.full_config
+        )
+        action = order["action"]
+        self.assertEqual(list(action), ["type", "orders", "grouping", "builder"])
+        self.assertEqual(
+            action["orders"],
+            [
+                {
+                    "a": 1,
+                    "b": True,
+                    "p": "3200",
+                    "s": "1.5",
+                    "r": False,
+                    "t": {"limit": {"tif": "Gtc"}},
+                    "c": cloid,
+                }
+            ],
+        )
+        self.assertEqual(list(action["orders"][0]), ["a", "b", "p", "s", "r", "t", "c"])
+        self.assertEqual(action["builder"], {"b": DUMMY_EVM_1, "f": 30})
+        self.assertEqual(order["coin"], "ETH")
+        self.assertEqual(order["endpoint"], "https://api.hyperliquid.xyz/exchange")
+
+        no_cloid = self._hl_build("BTC")["action"]["orders"][0]
+        self.assertEqual(list(no_cloid), ["a", "b", "p", "s", "r", "t"])
+        self.assertEqual(no_cloid["a"], 0)
+
+    def test_29_hyperliquid_perp_asset_index_keeps_case(self):
+        kpepe = self._hl_build("kPEPE")
+        self.assertEqual(kpepe["action"]["orders"][0]["a"], 3)
+        self.assertEqual(kpepe["coin"], "kPEPE")
+        self.assertEqual(self._hl_build("KPEPE")["action"]["orders"][0]["a"], 3)
+        self.assertEqual(self._hl_build("eth")["coin"], "ETH")
+        for unknown in ("OLD", "DOGE"):
+            with self.subTest(coin=unknown):
+                with self.assertRaisesRegex(ValueError, "Unknown or ambiguous Hyperliquid perp coin"):
+                    self._hl_build(unknown)
+
+    def test_30_hyperliquid_spot_asset_ids(self):
+        expectations = {
+            "PURR": (10000, "PURR/USDC"),
+            "purr": (10000, "PURR/USDC"),
+            "PURR/USDC": (10000, "PURR/USDC"),
+            "HYPE": (10001, "@1"),
+            "HYPE/USDC": (10001, "@1"),
+            "@1": (10001, "@1"),
+        }
+        for coin, (asset, name) in expectations.items():
+            with self.subTest(coin=coin):
+                built = self._hl_build(coin, is_spot=True)
+                self.assertEqual(built["action"]["orders"][0]["a"], asset)
+                self.assertEqual(built["coin"], name)
+                self.assertEqual(built["market_type"], "spot")
+        with self.assertRaisesRegex(ValueError, "Unknown or ambiguous Hyperliquid spot coin"):
+            self._hl_build("BTC", is_spot=True)
+
+    def test_31_hyperliquid_wire_numbers_match_float_to_wire(self):
+        cases = [
+            (0.00001, "0.00001"),
+            (97000.0, "97000"),
+            (0.1 + 0.2, "0.3"),
+            ("3200.0", "3200"),
+            ("1.50000000", "1.5"),
+            (12345678, "12345678"),
+        ]
+        for value, wire in cases:
+            with self.subTest(value=value):
+                order_wire = self._hl_build("BTC", sz=value, px=value)["action"]["orders"][0]
+                self.assertEqual((order_wire["p"], order_wire["s"]), (wire, wire))
+
+        for too_precise in ("0.000000001", 1e-9, "1.123456789"):
+            with self.subTest(value=too_precise):
+                with self.assertRaisesRegex(ValueError, "more than 8 decimals"):
+                    build_hyperliquid_order_payload(
+                        coin="BTC", is_buy=True, sz=too_precise, px="1", config=self.empty_config
+                    )
+
+    def test_32_hyperliquid_max_fee_rate_strings(self):
+        cases = [
+            (1, False, "0.001%"),
+            (5, False, "0.005%"),
+            (30, False, "0.03%"),
+            (MAX_HYPERLIQUID_PERP_TENTHS_BPS, False, "0.1%"),
+            (500, True, "0.5%"),
+            (MAX_HYPERLIQUID_TENTHS_BPS, True, "1%"),
+        ]
+        for tenths, is_spot, rate in cases:
+            with self.subTest(tenths=tenths, is_spot=is_spot):
+                cfg = OmniFeeConfig(
+                    hyperliquid_builder_address=DUMMY_EVM_1,
+                    hyperliquid_builder_tenths_bps=tenths,
+                )
+                built = self._hl_build("PURR" if is_spot else "BTC", is_spot=is_spot, config=cfg)
+                self.assertEqual(built["prerequisite_approve_builder_fee"]["maxFeeRate"], rate)
+                self.assertEqual(built["action"]["builder"], {"b": DUMMY_EVM_1, "f": tenths})
+
+    def test_33_hyperliquid_approve_builder_fee_complete(self):
+        cfg = OmniFeeConfig(
+            hyperliquid_builder_address=DUMMY_EVM_MIXED_CASE,
+            hyperliquid_builder_tenths_bps=30,
+        )
+        before_ms = int(time.time() * 1000)
+        built = self._hl_build("ETH", config=cfg)
+        after_ms = int(time.time() * 1000)
+
+        approve = built["prerequisite_approve_builder_fee"]
+        self.assertEqual(
+            {key: value for key, value in approve.items() if key != "nonce"},
+            {
+                "type": "approveBuilderFee",
+                "hyperliquidChain": "Mainnet",
+                "signatureChainId": "0x66eee",
+                "maxFeeRate": "0.03%",
+                "builder": DUMMY_EVM_MIXED_CASE.lower(),
+            },
+        )
+        self.assertIsInstance(approve["nonce"], int)
+        self.assertTrue(before_ms <= approve["nonce"] <= after_ms)
+        self.assertEqual(built["action"]["builder"], {"b": DUMMY_EVM_MIXED_CASE.lower(), "f": 30})
+
+    def test_34_hyperliquid_default_transport_posts_info(self):
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = json.dumps(
+                HL_META
+            ).encode("utf-8")
+            built = build_hyperliquid_order_payload(
+                coin="ETH", is_buy=True, sz="1", px="1", config=self.empty_config
+            )
+        self.assertEqual(built["action"]["orders"][0]["a"], 1)
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, HL_INFO_URL)
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(json.loads(request.data), {"type": "meta"})
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+
+    def test_35_mcp_tool_hyperliquid_build_order(self):
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 35,
+            "method": "tools/call",
+            "params": {
+                "name": "hyperliquid_build_order",
+                "arguments": {
+                    "coin": "kPEPE",
+                    "is_buy": False,
+                    "sz": "1000",
+                    "px": "0.012",
+                    "reduce_only": True,
+                },
+            },
+        }
+        with mock.patch("omni_execution_mcp.rails._hyperliquid_post", side_effect=fake_hl_transport):
+            res = handle_jsonrpc_message(msg, config=self.full_config)
+        self.assertFalse(res["result"]["isError"], res["result"]["content"][0]["text"])
+        payload = json.loads(res["result"]["content"][0]["text"])
+        self.assertEqual(
+            payload["action"]["orders"],
+            [{"a": 3, "b": False, "p": "0.012", "s": "1000", "r": True, "t": {"limit": {"tif": "Gtc"}}}],
+        )
+        self.assertEqual(payload["action"]["builder"], {"b": DUMMY_EVM_1, "f": 30})
+        self.assertEqual(payload["prerequisite_approve_builder_fee"]["signatureChainId"], "0x66eee")
+
+        msg["params"]["arguments"]["coin"] = "DOGE"
+        with mock.patch("omni_execution_mcp.rails._hyperliquid_post", side_effect=fake_hl_transport):
+            res = handle_jsonrpc_message(msg, config=self.full_config)
+        self.assertTrue(res["result"]["isError"])
+        self.assertIn("Unknown or ambiguous Hyperliquid perp coin", res["result"]["content"][0]["text"])
+
+    def test_36_hyperliquid_spot_tokens_keyed_by_index(self):
+        shuffled = {
+            "tokens": [
+                {"name": "USDC", "index": 0, "szDecimals": 8},
+                {"name": "HYPE", "index": 2, "szDecimals": 2},
+                {"name": "PURR", "index": 1, "szDecimals": 0},
+            ],
+            "universe": [
+                {"name": "PURR/USDC", "tokens": [1, 0], "index": 0},
+                {"name": "@107", "tokens": [2, 0], "index": 107},
+            ],
+        }
+        expectations = {"HYPE": (10107, "@107"), "PURR": (10000, "PURR/USDC")}
+        for coin, (asset, name) in expectations.items():
+            with self.subTest(coin=coin):
+                built = self._hl_build(
+                    coin,
+                    is_spot=True,
+                    transport=lambda url, body: json.dumps(shuffled).encode("utf-8"),
+                )
+                self.assertEqual(built["action"]["orders"][0]["a"], asset)
+                self.assertEqual(built["coin"], name)
+
+    def test_37_default_fee_monetization_config_from_empty_env(self):
+        # With empty env dict, all Day-0 non-custodial defaults must be active
+        cfg = OmniFeeConfig.from_env({})
+        self.assertEqual(cfg.hyperliquid_builder_address, DEFAULT_EVM_FEE_WALLET)
+        self.assertEqual(cfg.hyperliquid_builder_tenths_bps, 100)
+        self.assertEqual(cfg.jupiter_referral_account, DEFAULT_SOLANA_FEE_WALLET)
+        self.assertEqual(cfg.jupiter_fee_bps, 35)
+        self.assertEqual(cfg.lifi_integrator_id, "omni-execution-mcp")
+        self.assertEqual(cfg.lifi_fee_bps, 35)
+        self.assertEqual(cfg.cow_partner_fee_recipient, DEFAULT_EVM_FEE_WALLET)
+        self.assertEqual(cfg.cow_partner_fee_bps, 35)
+        self.assertEqual(cfg.zerox_fee_recipient, DEFAULT_EVM_FEE_WALLET)
+        self.assertEqual(cfg.zerox_fee_bps, 35)
+        self.assertTrue(cfg.is_hyperliquid_active)
+        self.assertTrue(cfg.is_jupiter_active)
+        self.assertTrue(cfg.is_lifi_active)
+        self.assertTrue(cfg.is_cow_active)
+        self.assertTrue(cfg.is_zerox_active)
+
+    def test_38_fee_monetization_explicit_opt_out(self):
+        # Test explicit disabling of rails via empty string, "none", "disabled", "off"
+        opt_out_env = {
+            "HYPERLIQUID_BUILDER_ADDRESS": "none",
+            "JUPITER_REFERRAL_ACCOUNT": "off",
+            "COW_PARTNER_FEE_RECIPIENT": "disabled",
+            "ZEROX_FEE_RECIPIENT": "",
+        }
+        cfg = OmniFeeConfig.from_env(opt_out_env)
+        self.assertIsNone(cfg.hyperliquid_builder_address)
+        self.assertEqual(cfg.hyperliquid_builder_tenths_bps, 0)
+        self.assertIsNone(cfg.jupiter_referral_account)
+        self.assertIsNone(cfg.cow_partner_fee_recipient)
+        self.assertIsNone(cfg.zerox_fee_recipient)
+        self.assertFalse(cfg.is_hyperliquid_active)
+        self.assertFalse(cfg.is_jupiter_active)
+        self.assertFalse(cfg.is_cow_active)
+        self.assertFalse(cfg.is_zerox_active)
 
 
 if __name__ == "__main__":

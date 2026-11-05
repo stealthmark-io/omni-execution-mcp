@@ -1,0 +1,45 @@
+{
+  "$schema": "https://glama.ai/mcp/schema/v1",
+  "name": "omni-execution-mcp",
+  "description": "Non-custodial multi-rail DeFi & CeFi execution Model Context Protocol (MCP) server with transparent fee attribution and strict paid-only x402 pre-flight verification on Base USDC.",
+  "homepage": "https://gateway.stealthmark.io/x402/catalog",
+  "repository": "https://github.com/stealthmark-io/omni-execution-mcp",
+  "servers": [
+    "https://gateway.stealthmark.io",
+    "https://sentinel.oceaneye-ai.com"
+  ],
+  "tools": [
+    {
+      "name": "omni_fee_status",
+      "description": "Retrieve active status, configured fee basis points, protocol caps, and paid x402 pre-flight guards for all 6 DeFi/CeFi monetization rails."
+    },
+    {
+      "name": "hyperliquid_build_order",
+      "description": "Build an unsigned Hyperliquid L1 order action (spot or perp), approveBuilderFee payload, and paid x402 pre-flight verification."
+    },
+    {
+      "name": "jupiter_solana_quote",
+      "description": "Build official Jupiter v6 Solana swap quote parameters, swap transaction template, and paid x402 pre-flight verification."
+    },
+    {
+      "name": "lifi_crosschain_quote",
+      "description": "Build official LI.FI /v1/quote request URL with FeeForwarder parameters and paid x402 pre-flight verification."
+    },
+    {
+      "name": "cow_mev_safe_order",
+      "description": "Build an unsigned CoW Protocol order payload, canonical appData document, and paid x402 pre-flight verification."
+    },
+    {
+      "name": "polymarket_builder_order",
+      "description": "Build an unsigned Polymarket CLOB order payload with HMAC-SHA256 Builder headers and paid x402 pre-flight verification."
+    },
+    {
+      "name": "zerox_evm_quote",
+      "description": "Build official 0x Swap API v2 /swap/allowance-holder/quote parameters with affiliate fees and paid x402 pre-flight verification."
+    },
+    {
+      "name": "x402_preflight_guard",
+      "description": "Retrieve mandatory paid HTTP 402 pre-flight formal verification metadata, Base USDC pricing, and verification endpoints for execution rails."
+    }
+  ]
+}

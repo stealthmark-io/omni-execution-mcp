@@ -1,0 +1,74 @@
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      HYPERLIQUID_BUILDER_ADDRESS:
+        type: string
+        default: "0xc8dc4ecb93c4c665Fad07E1261F5f7D60e3C6E0F"
+        description: "EVM address for Hyperliquid builder fee attribution"
+      HYPERLIQUID_BUILDER_TENTHS_BPS:
+        type: integer
+        default: 30
+        description: "Hyperliquid builder fee in tenths of bps (30 = 0.03%)"
+      JUPITER_REFERRAL_ACCOUNT:
+        type: string
+        default: "49sNhYNVSFxBuMPh5S2EC6Wkyay7mBWEPVv7pcyHJDxu"
+        description: "Solana Token Account for Jupiter referral fees"
+      JUPITER_FEE_BPS:
+        type: integer
+        default: 5
+        description: "Jupiter platform fee in bps (5 = 0.05%)"
+      LIFI_INTEGRATOR_ID:
+        type: string
+        default: "omni-execution-mcp"
+        description: "LI.FI integrator identifier"
+      LIFI_FEE_BPS:
+        type: integer
+        default: 5
+        description: "LI.FI FeeForwarder fee in bps (5 = 0.05%)"
+      COW_PARTNER_FEE_RECIPIENT:
+        type: string
+        default: "0xc8dc4ecb93c4c665Fad07E1261F5f7D60e3C6E0F"
+        description: "EVM address for CoW Protocol partner fee recipient"
+      COW_PARTNER_FEE_BPS:
+        type: integer
+        default: 5
+        description: "CoW Protocol partner fee in bps (5 = 0.05%)"
+      POLY_BUILDER_API_KEY:
+        type: string
+        description: "Polymarket Builder Program API key"
+      POLY_BUILDER_SECRET:
+        type: string
+        description: "Polymarket Builder Program HMAC secret"
+      POLY_BUILDER_PASSPHRASE:
+        type: string
+        description: "Polymarket Builder Program passphrase"
+      ZEROX_FEE_RECIPIENT:
+        type: string
+        default: "0xc8dc4ecb93c4c665Fad07E1261F5f7D60e3C6E0F"
+        description: "EVM address for 0x Swap API affiliate fee recipient"
+      ZEROX_FEE_BPS:
+        type: integer
+        default: 5
+        description: "0x Swap API affiliate fee in bps (5 = 0.05%)"
+  commandFunction: |-
+    (config) => ({
+      command: "python3",
+      args: ["-m", "omni_execution_mcp.server"],
+      env: {
+        ...(config.HYPERLIQUID_BUILDER_ADDRESS ? { HYPERLIQUID_BUILDER_ADDRESS: config.HYPERLIQUID_BUILDER_ADDRESS } : {}),
+        ...(config.HYPERLIQUID_BUILDER_TENTHS_BPS !== undefined ? { HYPERLIQUID_BUILDER_TENTHS_BPS: String(config.HYPERLIQUID_BUILDER_TENTHS_BPS) } : {}),
+        ...(config.JUPITER_REFERRAL_ACCOUNT ? { JUPITER_REFERRAL_ACCOUNT: config.JUPITER_REFERRAL_ACCOUNT } : {}),
+        ...(config.JUPITER_FEE_BPS !== undefined ? { JUPITER_FEE_BPS: String(config.JUPITER_FEE_BPS) } : {}),
+        ...(config.LIFI_INTEGRATOR_ID ? { LIFI_INTEGRATOR_ID: config.LIFI_INTEGRATOR_ID } : {}),
+        ...(config.LIFI_FEE_BPS !== undefined ? { LIFI_FEE_BPS: String(config.LIFI_FEE_BPS) } : {}),
+        ...(config.COW_PARTNER_FEE_RECIPIENT ? { COW_PARTNER_FEE_RECIPIENT: config.COW_PARTNER_FEE_RECIPIENT } : {}),
+        ...(config.COW_PARTNER_FEE_BPS !== undefined ? { COW_PARTNER_FEE_BPS: String(config.COW_PARTNER_FEE_BPS) } : {}),
+        ...(config.POLY_BUILDER_API_KEY ? { POLY_BUILDER_API_KEY: config.POLY_BUILDER_API_KEY } : {}),
+        ...(config.POLY_BUILDER_SECRET ? { POLY_BUILDER_SECRET: config.POLY_BUILDER_SECRET } : {}),
+        ...(config.POLY_BUILDER_PASSPHRASE ? { POLY_BUILDER_PASSPHRASE: config.POLY_BUILDER_PASSPHRASE } : {}),
+        ...(config.ZEROX_FEE_RECIPIENT ? { ZEROX_FEE_RECIPIENT: config.ZEROX_FEE_RECIPIENT } : {}),
+        ...(config.ZEROX_FEE_BPS !== undefined ? { ZEROX_FEE_BPS: String(config.ZEROX_FEE_BPS) } : {})
+      }
+    })

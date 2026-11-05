@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "omni-execution-mcp": {
+      "command": "python3",
+      "args": [
+        "-m",
+        "omni_execution_mcp.server"
+      ],
+      "env": {
+        "HYPERLIQUID_BUILDER_ADDRESS": "0xc8dc4ecb93c4c665Fad07E1261F5f7D60e3C6E0F",
+        "HYPERLIQUID_BUILDER_TENTHS_BPS": "30",
+        "JUPITER_REFERRAL_ACCOUNT": "49sNhYNVSFxBuMPh5S2EC6Wkyay7mBWEPVv7pcyHJDxu",
+        "JUPITER_FEE_BPS": "5",
+        "LIFI_INTEGRATOR_ID": "omni-execution-mcp",
+        "LIFI_FEE_BPS": "5",
+        "COW_PARTNER_FEE_RECIPIENT": "0xc8dc4ecb93c4c665Fad07E1261F5f7D60e3C6E0F",
+        "COW_PARTNER_FEE_BPS": "5",
+        "ZEROX_FEE_RECIPIENT": "0xc8dc4ecb93c4c665Fad07E1261F5f7D60e3C6E0F",
+        "ZEROX_FEE_BPS": "5"
+      }
+    }
+  }
+}
